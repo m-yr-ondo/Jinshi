@@ -1,0 +1,98 @@
+# Logiq Configuration File
+# Environment: production | development | testing
+
+bot:
+  token: "${DISCORD_BOT_TOKEN}"
+  prefix: "/"  # Slash commands only
+  status: "online"
+  activity: "Managing your community"
+  activity_type: "watching"  # playing, watching, listening, streaming
+
+database:
+  mongodb_uri: "${MONGODB_URI}"
+  database_name: "Logiq"
+  pool_size: 10
+
+logging:
+  level: "INFO"  # DEBUG, INFO, WARNING, ERROR, CRITICAL
+  file: "logs/bot.log"
+  format: "[%(asctime)s] [%(levelname)s] %(name)s: %(message)s"
+  date_format: "%Y-%m-%d %H:%M:%S"
+
+modules:
+  verification:
+    enabled: true
+    welcome_channel: null
+    verified_role: null
+    verification_type: "button"  # button, captcha, oauth
+
+  moderation:
+    enabled: true
+    log_channel: null
+    auto_mod:
+      spam_detection: true
+      toxicity_filter: false
+      max_mentions: 5
+      max_emojis: 10
+
+  roles:
+    enabled: true
+    self_assign: true
+    reaction_roles: true
+
+  leveling:
+    enabled: true
+    xp_per_message: 10
+    xp_cooldown: 60  # seconds
+    voice_xp_rate: 5  # per minute
+
+  economy:
+    enabled: true
+    currency_name: "ProgrammiCoin"
+    currency_symbol: "💎"
+    starting_balance: 1000
+    daily_reward: 100
+
+  ai_chat:
+    enabled: false
+    provider: "openai"  # openai, anthropic
+    api_key: ""
+    model: "gpt-4"
+    max_tokens: 500
+    temperature: 0.7
+
+  tickets:
+    enabled: true
+    ticket_category: null
+    support_role: null
+
+  analytics:
+    enabled: true
+    report_channel: null
+    report_interval: 604800  # 7 days in seconds
+
+  games:
+    enabled: true
+    betting_enabled: true
+
+web:
+  enabled: true
+  host: "0.0.0.0"
+  port: 8000
+  cors_origins:
+    - "http://localhost:3000"
+    - "https://yourdomain.com"
+
+redis:
+  enabled: false
+  host: "localhost"
+  port: 6379
+  db: 0
+  password: null
+
+api_keys:
+  openai: ""
+  anthropic: ""
+  youtube: ""
+  spotify_client_id: ""
+  spotify_client_secret: ""
