@@ -20,6 +20,59 @@ from database.db_manager import DatabaseManager
 logger = logging.getLogger(__name__)
 
 
+class ResetLevelsConfirmView(discord.ui.View):
+    """Confirmation view shown before wiping every level in a guild"""
+
+    def __init__(self, db: DatabaseManager, guild_id: int, author_id: int):
+        super().__init__(timeout=30)
+        self.db = db
+        self.guild_id = guild_id
+        self.author_id = author_id
+        self.responded = False
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # Only the admin who ran the command can confirm/cancel it
+        return interaction.user.id == self.author_id
+
+    @discord.ui.button(label="Confirm Reset", style=discord.ButtonStyle.danger, emoji="⚠️")
+    async def confirm(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.responded = True
+        count = await self.db.reset_guild_levels(self.guild_id)
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(
+            embed=EmbedFactory.success(
+                "Levels Reset",
+                f"Reset XP and level to 0 for **{count}** member(s) in this server."
+            ),
+            view=self
+        )
+        logger.info(f"{interaction.user} reset all levels in guild {self.guild_id} ({count} affected)")
+
+    @discord.ui.button(label="Cancel", style=discord.ButtonStyle.secondary)
+    async def cancel(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.responded = True
+        for child in self.children:
+            child.disabled = True
+        await interaction.response.edit_message(
+            embed=EmbedFactory.warning("Cancelled", "No levels were changed."),
+            view=self
+        )
+
+    async def on_timeout(self) -> None:
+        if not self.responded:
+            for child in self.children:
+                child.disabled = True
+            # message may be gone/edited already; best effort only
+            try:
+                await self.message.edit(
+                    embed=EmbedFactory.warning("Cancelled", "Confirmation timed out. No levels were changed."),
+                    view=self
+                )
+            except (discord.NotFound, discord.HTTPException, AttributeError):
+                pass
+
+
 class Leveling(commands.Cog):
     """Leveling system cog"""
 
@@ -59,17 +112,20 @@ class Leveling(commands.Cog):
         new_xp = user_data.get('xp', 0) + xp_gain
         current_level = user_data.get('level', 0)
 
-        # Check for level up
-        next_level_xp = calculate_level_xp(current_level + 1)
+        # Check for level up - loop rather than checking only +1, so a large
+        # XP gain (e.g. from an admin adjustment) correctly climbs through
+        # every threshold crossed instead of getting stuck one level behind.
+        new_level = current_level
+        while new_xp >= calculate_level_xp(new_level + 1):
+            new_level += 1
 
-        if new_xp >= next_level_xp:
-            new_level = current_level + 1
+        if new_level > current_level:
             await self.db.update_user(message.author.id, message.guild.id, {
                 'xp': new_xp,
                 'level': new_level
             })
 
-            # Send level up message
+            # Send level up message (once, for the final level reached)
             embed = EmbedFactory.level_up(message.author, new_level, new_xp)
             await message.channel.send(embed=embed)
             logger.info(f"{message.author} leveled up to {new_level} in {message.guild}")
@@ -98,7 +154,7 @@ class Leveling(commands.Cog):
             )
             return
 
-        xp = sum(calculate_level_xp(i) for i in range(1, level + 1))
+        xp = calculate_level_xp(level)
 
         await self.db.update_user(user.id, interaction.guild.id, {
             'level': level,
@@ -115,16 +171,18 @@ class Leveling(commands.Cog):
     @app_commands.command(name="resetlevels", description="Reset all levels (Admin)")
     @is_admin()
     async def reset_levels(self, interaction: discord.Interaction):
-        """Reset all levels in guild"""
-        # This would require a bulk update - implementing basic version
+        """Reset all levels in guild (requires confirmation - destructive)"""
+        view = ResetLevelsConfirmView(self.db, interaction.guild.id, interaction.user.id)
         await interaction.response.send_message(
             embed=EmbedFactory.warning(
-                "Reset Levels",
-                "This feature will reset all user levels. This is a destructive action.\n\n"
-                "To implement: Use database bulk operations to reset all users in this guild."
+                "Reset All Levels?",
+                "This will set **every** member's XP and level back to 0 in this server. "
+                "This cannot be undone.\n\nConfirm within 30 seconds to proceed."
             ),
+            view=view,
             ephemeral=True
         )
+        view.message = await interaction.original_response()
 
 
 async def setup(bot: commands.Bot):

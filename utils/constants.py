@@ -34,8 +34,8 @@ EMOJIS = {
 LEVELING = {
     "xp_per_message": 10,
     "xp_cooldown": 60,  # seconds
-    "base_xp": 100,
-    "xp_multiplier": 1.5
+    "base_xp": 250,
+    "xp_multiplier": 1.7
 }
 
 def calculate_level_xp(level: int) -> int:
