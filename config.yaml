@@ -75,6 +75,10 @@ modules:
     enabled: true
     betting_enabled: true
 
+  activity_tracker:
+    enabled: true
+    channel_id: 1404184118941581444
+
 web:
   enabled: true
   host: "0.0.0.0"

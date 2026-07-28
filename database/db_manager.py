@@ -120,6 +120,28 @@ class DatabaseManager:
         )
         return result.modified_count > 0
 
+    async def add_activity_seconds(self, guild_id: int, user_id: int, date_str: str,
+                                    activity_type: str, activity_name: str, seconds: float) -> None:
+        """Add elapsed seconds to a user's daily activity bucket (game name, or 'Spotify')"""
+        if seconds <= 0:
+            return
+        await self.db.activity_daily.update_one(
+            {"guild_id": guild_id, "user_id": user_id, "date": date_str,
+             "type": activity_type, "name": activity_name},
+            {"$inc": {"seconds": seconds}},
+            upsert=True
+        )
+
+    async def get_daily_activity(self, guild_id: int, date_str: str) -> Dict[int, List[Dict[str, Any]]]:
+        """Return today's activity entries grouped by user_id: {user_id: [{type, name, seconds}, ...]}"""
+        cursor = self.db.activity_daily.find({"guild_id": guild_id, "date": date_str})
+        by_user: Dict[int, List[Dict[str, Any]]] = {}
+        async for doc in cursor:
+            by_user.setdefault(doc["user_id"], []).append(
+                {"type": doc["type"], "name": doc["name"], "seconds": doc["seconds"]}
+            )
+        return by_user
+
     # Guild operations
     async def get_guild(self, guild_id: int) -> Optional[Dict[str, Any]]:
         """Get guild configuration"""
