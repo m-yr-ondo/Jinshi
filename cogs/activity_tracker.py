@@ -1,13 +1,19 @@
 """
-Activity Tracker Cog for Logiq
-Tracks daily game-playing and Spotify-listening time via presence updates,
-and posts a per-member summary card at 10pm local (Africa/Nairobi) time.
+Tracks daily game-playing and Spotify-listening time via Discord presence
+and the Steam Web API, and posts a per-member summary card at 10pm local time (edit as you see fit)
+
+Steam vs Discord priority: if Steam reports someone in-game, that's treated
+as authoritative for that person's "game" slot and Discord's own presence
+event for a game is ignored while Steam owns it - this avoids double-counting
+the same play session from two sources. 
 """
 
+import os
 import random
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands, tasks
@@ -21,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 TZ = ZoneInfo("Africa/Nairobi")
 CHECKPOINT_MINUTES = 5  # how often ongoing sessions are saved, bounding restart data-loss to this window
+STEAM_POLL_SECONDS = 60
 
 NO_ACTIVITY_LINES = [
     "{name} was not feeling well today.",
@@ -39,20 +46,43 @@ def _classify(activity: discord.BaseActivity):
     return None
 
 
+def _parse_steam_links(raw: str) -> dict:
+    """STEAM_LINKS format: 'discord_id:steamid_or_vanity,discord_id:steamid_or_vanity,...'"""
+    links = {}
+    for pair in (raw or "").split(","):
+        pair = pair.strip()
+        if not pair or ":" not in pair:
+            continue
+        discord_id, steam_ref = pair.split(":", 1)
+        links[int(discord_id.strip())] = steam_ref.strip()
+    return links
+
+
 class ActivityTracker(commands.Cog):
     def __init__(self, bot: commands.Bot, db: DatabaseManager, config: dict):
         self.bot = bot
         self.db = db
         self.module_config = config.get("modules", {}).get("activity_tracker", {})
-        # in-memory: {(guild_id, user_id, type, name): start_time}
+        # in-memory: {(guild_id, user_id, type, name): start_time} - shared by Discord and Steam sources
         self.sessions = {}
         self.last_report_date = None
+
+        self.steam_api_key = os.environ.get("STEAM_API_KEY")
+        self.steam_links = _parse_steam_links(os.environ.get("STEAM_LINKS", ""))
+        self.resolved_steam_ids = {}  # discord_id -> numeric steamid64, filled in on_ready
+        self.steam_active_game = {}  # discord_id -> game name, only set while Steam says they're in-game
+        self.http = aiohttp.ClientSession()
+
         self.daily_report.start()
         self.checkpoint_sessions.start()
+        if self.steam_api_key and self.steam_links:
+            self.poll_steam.start()
 
     def cog_unload(self):
         self.daily_report.cancel()
         self.checkpoint_sessions.cancel()
+        self.poll_steam.cancel()
+        self.bot.loop.create_task(self.http.close())
 
     @commands.Cog.listener()
     async def on_ready(self):
@@ -69,6 +99,87 @@ class ActivityTracker(commands.Cog):
                         key = (guild.id, member.id, *classified)
                         self.sessions.setdefault(key, now)
 
+        # Resolve any vanity-name Steam links to real numeric SteamID64s once
+        if self.steam_api_key:
+            for discord_id, steam_ref in self.steam_links.items():
+                if steam_ref.isdigit():
+                    self.resolved_steam_ids[discord_id] = steam_ref
+                    continue
+                try:
+                    async with self.http.get(
+                        "https://api.steampowered.com/ISteamUser/ResolveVanityURL/v1/",
+                        params={"key": self.steam_api_key, "vanityurl": steam_ref}
+                    ) as resp:
+                        data = await resp.json()
+                        result = data.get("response", {})
+                        if result.get("success") == 1:
+                            self.resolved_steam_ids[discord_id] = result["steamid"]
+                        else:
+                            logger.warning(f"Could not resolve Steam vanity URL '{steam_ref}' for discord user {discord_id}")
+                except Exception as e:
+                    logger.error(f"Steam vanity resolution failed for {steam_ref}: {e}")
+
+    def _find_guild_for(self, discord_id: int):
+        for guild in self.bot.guilds:
+            if guild.get_member(discord_id):
+                return guild
+        return None
+
+    @tasks.loop(seconds=STEAM_POLL_SECONDS)
+    async def poll_steam(self):
+        steamids = list(self.resolved_steam_ids.values())
+        if not steamids:
+            return
+
+        try:
+            async with self.http.get(
+                "https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v0002/",
+                params={"key": self.steam_api_key, "steamids": ",".join(steamids)}
+            ) as resp:
+                data = await resp.json()
+                players = {p["steamid"]: p for p in data.get("response", {}).get("players", [])}
+        except Exception as e:
+            logger.error(f"Steam API poll failed: {e}")
+            return
+
+        now = datetime.now(TZ)
+        by_discord_id = {v: k for k, v in self.resolved_steam_ids.items()}
+
+        for steamid, player in players.items():
+            discord_id = by_discord_id.get(steamid)
+            if discord_id is None:
+                continue
+            guild = self._find_guild_for(discord_id)
+            if not guild:
+                continue
+
+            current_game = player.get("gameextrainfo")  # None if not currently in a game
+            previous_game = self.steam_active_game.get(discord_id)
+
+            if current_game == previous_game:
+                continue  # no change, still in the same game or still idle
+
+            # Close out the previous Steam session, if any
+            if previous_game:
+                key = (guild.id, discord_id, "steam_game", previous_game)
+                start = self.sessions.pop(key, None)
+                if start:
+                    elapsed = (now - start).total_seconds()
+                    await self.db.add_activity_seconds(
+                        guild.id, discord_id, now.strftime("%Y-%m-%d"), "steam_game", previous_game, elapsed
+                    )
+
+            # Start a new one, if they're now in a game
+            if current_game:
+                self.sessions[(guild.id, discord_id, "steam_game", current_game)] = now
+                self.steam_active_game[discord_id] = current_game
+            else:
+                self.steam_active_game.pop(discord_id, None)
+
+    @poll_steam.before_loop
+    async def before_poll_steam(self):
+        await self.bot.wait_until_ready()
+
     @commands.Cog.listener()
     async def on_presence_update(self, before: discord.Member, after: discord.Member):
         if after.bot or not self.module_config.get("enabled", True):
@@ -79,8 +190,10 @@ class ActivityTracker(commands.Cog):
 
         now = datetime.now(TZ)
 
-        # Started
+        # Started - skip "game" entries while Steam already owns this person's game slot
         for classified in after_keys - before_keys:
+            if classified[0] == "game" and self.steam_active_game.get(after.id):
+                continue
             key = (after.guild.id, after.id, *classified)
             self.sessions.setdefault(key, now)
 
@@ -136,6 +249,7 @@ class ActivityTracker(commands.Cog):
                     if entry["type"] == "spotify":
                         spotify_seconds += entry["seconds"]
                     else:
+                        # "game" (Discord presence) and "steam_game" (Steam API) both render the same way
                         lines.append(f"**{entry['name']}** - {entry['seconds'] / 3600:.1f}h")
                 if spotify_seconds:
                     lines.append(f"**Spotify** - {spotify_seconds / 3600:.1f}h")
