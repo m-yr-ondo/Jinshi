@@ -9,15 +9,18 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import discord
+from discord import app_commands
 from discord.ext import commands, tasks
 import logging
 
 from utils.embeds import EmbedFactory, EmbedColor
+from utils.permissions import is_admin
 from database.db_manager import DatabaseManager
 
 logger = logging.getLogger(__name__)
 
 TZ = ZoneInfo("Africa/Nairobi")
+CHECKPOINT_MINUTES = 5  # how often ongoing sessions are saved, bounding restart data-loss to this window
 
 NO_ACTIVITY_LINES = [
     "{name} was not feeling well today.",
@@ -45,9 +48,11 @@ class ActivityTracker(commands.Cog):
         self.sessions = {}
         self.last_report_date = None
         self.daily_report.start()
+        self.checkpoint_sessions.start()
 
     def cog_unload(self):
         self.daily_report.cancel()
+        self.checkpoint_sessions.cancel()
 
     @commands.Cog.listener()
     async def on_ready(self):
@@ -90,6 +95,60 @@ class ActivityTracker(commands.Cog):
                     classified[0], classified[1], elapsed
                 )
 
+    async def _flush_all_sessions(self, now: datetime):
+        """Save elapsed time for every ongoing session so far, then reset their clocks.
+        Used both by the periodic checkpoint and before building a report, so a
+        restart or a report never loses more than CHECKPOINT_MINUTES of progress."""
+        for key, start in list(self.sessions.items()):
+            g_id, u_id, a_type, a_name = key
+            elapsed = (now - start).total_seconds()
+            await self.db.add_activity_seconds(
+                g_id, u_id, now.strftime("%Y-%m-%d"), a_type, a_name, elapsed
+            )
+            self.sessions[key] = now
+
+    @tasks.loop(minutes=CHECKPOINT_MINUTES)
+    async def checkpoint_sessions(self):
+        await self._flush_all_sessions(datetime.now(TZ))
+
+    @checkpoint_sessions.before_loop
+    async def before_checkpoint(self):
+        await self.bot.wait_until_ready()
+
+    async def _send_report(self, guild: discord.Guild, channel: discord.TextChannel, date_str: str):
+        activity_by_user = await self.db.get_daily_activity(guild.id, date_str)
+
+        for member in guild.members:
+            if member.bot:
+                continue
+            entries = activity_by_user.get(member.id)
+            if not entries:
+                embed = EmbedFactory.create(
+                    title=member.display_name,
+                    description=random.choice(NO_ACTIVITY_LINES).format(name=member.display_name),
+                    color=EmbedColor.INFO,
+                    thumbnail=member.display_avatar.url
+                )
+            else:
+                lines = []
+                spotify_seconds = 0
+                for entry in entries:
+                    if entry["type"] == "spotify":
+                        spotify_seconds += entry["seconds"]
+                    else:
+                        lines.append(f"**{entry['name']}** - {entry['seconds'] / 3600:.1f}h")
+                if spotify_seconds:
+                    lines.append(f"**Spotify** - {spotify_seconds / 3600:.1f}h")
+
+                embed = EmbedFactory.create(
+                    title=member.display_name,
+                    description="\n".join(lines),
+                    color=EmbedColor.PRIMARY,
+                    thumbnail=member.display_avatar.url,
+                    footer="Today's activity"
+                )
+            await channel.send(embed=embed)
+
     @tasks.loop(minutes=1)
     async def daily_report(self):
         now = datetime.now(TZ)
@@ -104,55 +163,33 @@ class ActivityTracker(commands.Cog):
         if not channel_id:
             return
 
+        await self._flush_all_sessions(now)
+
         for guild in self.bot.guilds:
             channel = guild.get_channel(channel_id)
-            if not channel:
-                continue
-
-            # Flush any sessions still running so today's totals include them
-            for (g_id, u_id, a_type, a_name), start in list(self.sessions.items()):
-                if g_id != guild.id:
-                    continue
-                elapsed = (now - start).total_seconds()
-                await self.db.add_activity_seconds(guild.id, u_id, today, a_type, a_name, elapsed)
-                self.sessions[(g_id, u_id, a_type, a_name)] = now  # keep tracking, reset the clock
-
-            activity_by_user = await self.db.get_daily_activity(guild.id, today)
-
-            for member in guild.members:
-                if member.bot:
-                    continue
-                entries = activity_by_user.get(member.id)
-                if not entries:
-                    embed = EmbedFactory.create(
-                        title=member.display_name,
-                        description=random.choice(NO_ACTIVITY_LINES).format(name=member.display_name),
-                        color=EmbedColor.INFO,
-                        thumbnail=member.display_avatar.url
-                    )
-                else:
-                    lines = []
-                    spotify_seconds = 0
-                    for entry in entries:
-                        if entry["type"] == "spotify":
-                            spotify_seconds += entry["seconds"]
-                        else:
-                            lines.append(f"**{entry['name']}** - {entry['seconds'] / 3600:.1f}h")
-                    if spotify_seconds:
-                        lines.append(f"**Spotify** - {spotify_seconds / 3600:.1f}h")
-
-                    embed = EmbedFactory.create(
-                        title=member.display_name,
-                        description="\n".join(lines),
-                        color=EmbedColor.PRIMARY,
-                        thumbnail=member.display_avatar.url,
-                        footer="Today's activity"
-                    )
-                await channel.send(embed=embed)
+            if channel:
+                await self._send_report(guild, channel, today)
 
     @daily_report.before_loop
     async def before_daily_report(self):
         await self.bot.wait_until_ready()
+
+    @app_commands.command(name="testactivityreport", description="Send today's activity report right now (Admin)")
+    @is_admin()
+    async def test_activity_report(self, interaction: discord.Interaction):
+        channel_id = self.module_config.get("channel_id")
+        channel = interaction.guild.get_channel(channel_id) if channel_id else None
+        if not channel:
+            await interaction.response.send_message(
+                embed=EmbedFactory.error("No Report Channel", "activity_tracker.channel_id isn't set or the channel wasn't found."),
+                ephemeral=True
+            )
+            return
+
+        await interaction.response.send_message("Sending test report now...", ephemeral=True)
+        now = datetime.now(TZ)
+        await self._flush_all_sessions(now)
+        await self._send_report(interaction.guild, channel, now.strftime("%Y-%m-%d"))
 
 
 async def setup(bot: commands.Bot):
