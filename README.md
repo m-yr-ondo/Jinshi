@@ -762,14 +762,4 @@ This bot now has **ALL** the features of MEE6 and more:
 - Music audio playback: Install `yt-dlp` and `PyNaCl` + FFmpeg for YouTube playback
 - Social alerts live monitoring: Add API keys to .env for real-time notifications
 
----
 
-## 💬 Support
-
-For licensing inquiries or support, contact Programmify.
-
----
-
-**Built by Programmify with ❤️**
-
-**Open Source MEE6 Alternative - Completely Free!**
