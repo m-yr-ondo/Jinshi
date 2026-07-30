@@ -132,6 +132,16 @@ class DatabaseManager:
             upsert=True
         )
 
+    async def set_activity_seconds(self, guild_id: int, user_id: int, date_str: str,
+                                    activity_type: str, activity_name: str, seconds: float) -> None:
+        """Set the exact seconds for a daily activity bucket, overwriting any previous value"""
+        await self.db.activity_daily.update_one(
+            {"guild_id": guild_id, "user_id": user_id, "date": date_str,
+             "type": activity_type, "name": activity_name},
+            {"$set": {"seconds": seconds}},
+            upsert=True
+        )
+
     async def get_daily_activity(self, guild_id: int, date_str: str) -> Dict[int, List[Dict[str, Any]]]:
         """Return today's activity entries grouped by user_id: {user_id: [{type, name, seconds}, ...]}"""
         cursor = self.db.activity_daily.find({"guild_id": guild_id, "date": date_str})

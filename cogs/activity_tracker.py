@@ -1,11 +1,14 @@
 """
-Tracks daily game-playing and Spotify-listening time via Discord presence
-and the Steam Web API, and posts a per-member summary card at 10pm local time (edit as you see fit)
+Tracks daily game-playing and Spotify-listening time and posts a per-member
+summary card at 10pm local time (edit as you see fit).
+
+Games come from Discord presence and the Steam Web API; Spotify listening comes
+from polling the public stats.fm API for each configured user.
 
 Steam vs Discord priority: if Steam reports someone in-game, that's treated
 as authoritative for that person's "game" slot and Discord's own presence
 event for a game is ignored while Steam owns it - this avoids double-counting
-the same play session from two sources. 
+the same play session from two sources.
 """
 
 import os
@@ -28,6 +31,9 @@ logger = logging.getLogger(__name__)
 TZ = ZoneInfo("Africa/Nairobi")
 CHECKPOINT_MINUTES = 5  # how often ongoing sessions are saved, bounding restart data-loss to this window
 STEAM_POLL_SECONDS = 60
+STATSFM_POLL_SECONDS = 300  # stats.fm is polled every 5 minutes
+# stats.fm's CDN 403s aiohttp's default User-Agent, so identify the bot explicitly
+STATSFM_HEADERS = {"User-Agent": "JinshiBot/1.0 (discord activity tracker)"}
 
 NO_ACTIVITY_LINES = [
     "{name} was not feeling well today.",
@@ -38,9 +44,7 @@ NO_ACTIVITY_LINES = [
 
 
 def _classify(activity: discord.BaseActivity):
-    """Return (type, name) for activities we care about, or None to ignore it"""
-    if isinstance(activity, discord.Spotify):
-        return ("spotify", "Spotify")
+    """Return (type, name) for game activities we care about, or None to ignore it"""
     if isinstance(activity, discord.Activity) and activity.type == discord.ActivityType.playing:
         return ("game", activity.name)
     return None
@@ -73,15 +77,22 @@ class ActivityTracker(commands.Cog):
         self.steam_active_game = {}  # discord_id -> game name, only set while Steam says they're in-game
         self.http = aiohttp.ClientSession()
 
+        # stats.fm mapping: {discord_id_str: stats_fm_profile_slug}
+        raw_mapping = self.module_config.get("statsfm_users", {})
+        self.statsfm_users = {int(k): v for k, v in raw_mapping.items()}
+
         self.daily_report.start()
         self.checkpoint_sessions.start()
         if self.steam_api_key and self.steam_links:
             self.poll_steam.start()
+        if self.statsfm_users:
+            self._poll_statsfm.start()
 
     def cog_unload(self):
         self.daily_report.cancel()
         self.checkpoint_sessions.cancel()
         self.poll_steam.cancel()
+        self._poll_statsfm.cancel()
         self.bot.loop.create_task(self.http.close())
 
     @commands.Cog.listener()
@@ -178,6 +189,59 @@ class ActivityTracker(commands.Cog):
 
     @poll_steam.before_loop
     async def before_poll_steam(self):
+        await self.bot.wait_until_ready()
+
+    @tasks.loop(seconds=STATSFM_POLL_SECONDS)
+    async def _poll_statsfm(self):
+        """Poll stats.fm for each mapped profile and set today's Spotify seconds.
+
+        The streams endpoint returns newest-first and its `before` cursor does not
+        paginate, so we pull a single generous page and filter client-side - a
+        single day's streams never approach this limit.
+        """
+        today_start = datetime.now(TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+        today_end = today_start.replace(hour=22)
+        today_str = today_start.strftime("%Y-%m-%d")
+
+        # Group by profile so alt Discord accounts sharing one stats.fm user are
+        # fetched once and reported once, not once per Discord id.
+        by_profile = {}
+        for discord_id, profile in self.statsfm_users.items():
+            by_profile.setdefault(profile, []).append(discord_id)
+
+        for profile, discord_ids in by_profile.items():
+            url = f"https://api.stats.fm/api/v1/users/{profile}/streams?limit=1000"
+            try:
+                async with self.http.get(url, headers=STATSFM_HEADERS) as resp:
+                    if resp.status != 200:
+                        logger.warning(f"stats.fm API returned {resp.status} for {profile}")
+                        continue
+                    items = (await resp.json()).get("items", [])
+            except Exception as e:
+                logger.error(f"stats.fm fetch failed for {profile}: {e}")
+                continue
+
+            total_seconds = 0.0
+            for s in items:
+                try:
+                    ts = datetime.fromisoformat(s["endTime"].replace("Z", "+00:00"))
+                except (ValueError, KeyError):
+                    continue
+                if today_start <= ts <= today_end:
+                    total_seconds += s.get("playedMs", 0) / 1000.0
+
+            # One stats.fm profile -> one report entry: attribute the total to the
+            # first mapped account that's actually in a guild.
+            for discord_id in discord_ids:
+                guild = self._find_guild_for(discord_id)
+                if guild:
+                    await self.db.set_activity_seconds(
+                        guild.id, discord_id, today_str, "spotify", "Spotify", total_seconds
+                    )
+                    break
+
+    @_poll_statsfm.before_loop
+    async def before_poll_statsfm(self):
         await self.bot.wait_until_ready()
 
     @commands.Cog.listener()
