@@ -1,4 +1,4 @@
-# 🤖 Logiq - Open Source Discord Bot
+# Jinshi Discord Bot
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/downloads/)
@@ -762,14 +762,4 @@ This bot now has **ALL** the features of MEE6 and more:
 - Music audio playback: Install `yt-dlp` and `PyNaCl` + FFmpeg for YouTube playback
 - Social alerts live monitoring: Add API keys to .env for real-time notifications
 
----
 
-## 💬 Support
-
-For licensing inquiries or support, contact Programmify.
-
----
-
-**Built by Programmify with ❤️**
-
-**Open Source MEE6 Alternative - Completely Free!**
