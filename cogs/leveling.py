@@ -1,11 +1,10 @@
 """
-Leveling Cog for Logiq
 XP and leveling system with rank cards
 """
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 from datetime import datetime
 from typing import Optional
 import logging
@@ -82,6 +81,55 @@ class Leveling(commands.Cog):
         self.config = config
         self.module_config = config.get('modules', {}).get('leveling', {})
         self.xp_cooldown = {}
+        self.voice_xp_tick.start()
+
+    def cog_unload(self):
+        self.voice_xp_tick.cancel()
+
+    async def _award_xp(self, user_id: int, guild_id: int, amount: int, announce_channel: Optional[discord.TextChannel] = None):
+        """Shared XP-award + level-up logic, used by both message and voice XP"""
+        user_data = await self.db.get_user(user_id, guild_id)
+        if not user_data:
+            user_data = await self.db.create_user(user_id, guild_id)
+
+        new_xp = user_data.get('xp', 0) + amount
+        current_level = user_data.get('level', 0)
+
+        new_level = current_level
+        while new_xp >= calculate_level_xp(new_level + 1):
+            new_level += 1
+
+        if new_level > current_level:
+            await self.db.update_user(user_id, guild_id, {'xp': new_xp, 'level': new_level})
+            logger.info(f"User {user_id} leveled up to {new_level} in guild {guild_id}")
+            if announce_channel:
+                member = announce_channel.guild.get_member(user_id)
+                if member:
+                    await announce_channel.send(embed=EmbedFactory.level_up(member, new_level, new_xp))
+        else:
+            await self.db.update_user(user_id, guild_id, {'xp': new_xp})
+
+    @tasks.loop(minutes=1)
+    async def voice_xp_tick(self):
+        """Award voice XP once per minute to anyone in a voice channel with at least
+        one other human present - prevents farming XP by idling alone in an empty VC."""
+        if not self.module_config.get('enabled', True):
+            return
+        rate = self.module_config.get('voice_xp_rate', 5)
+
+        for guild in self.bot.guilds:
+            for channel in guild.voice_channels:
+                if channel == guild.afk_channel:
+                    continue
+                humans = [m for m in channel.members if not m.bot]
+                if len(humans) < 2:
+                    continue
+                for member in humans:
+                    await self._award_xp(member.id, guild.id, rate, announce_channel=guild.system_channel)
+
+    @voice_xp_tick.before_loop
+    async def before_voice_xp_tick(self):
+        await self.bot.wait_until_ready()
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message):
@@ -101,36 +149,8 @@ class Leveling(commands.Cog):
                 return
 
         self.xp_cooldown[user_key] = current_time
-
-        # Get or create user
-        user_data = await self.db.get_user(message.author.id, message.guild.id)
-        if not user_data:
-            user_data = await self.db.create_user(message.author.id, message.guild.id)
-
-        # Calculate XP
         xp_gain = self.module_config.get('xp_per_message', 10)
-        new_xp = user_data.get('xp', 0) + xp_gain
-        current_level = user_data.get('level', 0)
-
-        # Check for level up - loop rather than checking only +1, so a large
-        # XP gain (e.g. from an admin adjustment) correctly climbs through
-        # every threshold crossed instead of getting stuck one level behind.
-        new_level = current_level
-        while new_xp >= calculate_level_xp(new_level + 1):
-            new_level += 1
-
-        if new_level > current_level:
-            await self.db.update_user(message.author.id, message.guild.id, {
-                'xp': new_xp,
-                'level': new_level
-            })
-
-            # Send level up message (once, for the final level reached)
-            embed = EmbedFactory.level_up(message.author, new_level, new_xp)
-            await message.channel.send(embed=embed)
-            logger.info(f"{message.author} leveled up to {new_level} in {message.guild}")
-        else:
-            await self.db.update_user(message.author.id, message.guild.id, {'xp': new_xp})
+        await self._award_xp(message.author.id, message.guild.id, xp_gain, announce_channel=message.channel)
 
     # NOTE: /rank and /leaderboard commands have been moved to games.py as PUBLIC commands
 
