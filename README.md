@@ -27,6 +27,8 @@ Create `.env` file:
 DISCORD_BOT_TOKEN=your_discord_bot_token
 MONGODB_URI=mongodb://localhost:27017
 ENVIRONMENT=development
+STEAM_API_KEY=<your real key>
+STEAM_LINKS=<your 5 discord_id:steamid pairs, comma-separated>
 ```
 
 ### 3. Run Bot
