@@ -78,6 +78,13 @@ modules:
   activity_tracker:
     enabled: true
     channel_id: 1404184118941581444
+    statsfm_users:
+      "640299465076637707": "m.yr.on"
+      "702605632209027172": "cloudsurfer"
+      "768108618800562197": "254kenyanxd.com"
+      "1343151971871359018": "254kenyanxd.com"
+      "1385336967343898697": "n33zr4q58dlyopmbqg9qmdfjd"
+      "1137415421100822579": "onlyian"
 
 web:
   enabled: true
