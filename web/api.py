@@ -3,7 +3,7 @@ FastAPI Web Dashboard for Logiq
 REST API endpoints for bot statistics and management
 """
 
-from fastapi import FastAPI, HTTPException, Depends
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
@@ -11,8 +11,11 @@ from typing import Optional, Dict, Any, List
 from datetime import datetime, timedelta
 import logging
 import os
+import hmac
+import re
 
 logger = logging.getLogger(__name__)
+SNOWFLAKE_RE = re.compile(r"^\d{17,20}$")
 
 
 def create_app(bot) -> FastAPI:
@@ -194,5 +197,92 @@ def create_app(bot) -> FastAPI:
                 for name, config in modules.items()
             }
         }
+
+    @app.post("/internal/checkers-result")
+    async def record_checkers_result(request: Request):
+        """Record one authenticated, idempotent result from the Activity server."""
+        expected_secret = os.getenv("INTERNAL_API_SECRET")
+        provided_secret = request.headers.get("X-Internal-Secret")
+        if not expected_secret:
+            logger.error("INTERNAL_API_SECRET is not configured")
+            raise HTTPException(status_code=503, detail="Internal API is not configured")
+        if not provided_secret or not hmac.compare_digest(provided_secret, expected_secret):
+            raise HTTPException(status_code=401, detail="Unauthorized")
+
+        try:
+            payload = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="Body must be valid JSON")
+        if not isinstance(payload, dict):
+            raise HTTPException(status_code=400, detail="Body must be a JSON object")
+
+        required = {"guild_id", "game_id", "outcome", "reason", "player_ids"}
+        if not required.issubset(payload):
+            raise HTTPException(status_code=400, detail="Missing required result fields")
+
+        guild_id = payload["guild_id"]
+        game_id = payload["game_id"]
+        outcome = payload["outcome"]
+        reason = payload["reason"]
+        player_ids = payload["player_ids"]
+        valid_reasons = {"captured", "blocked", "repetition", "forfeit", "resignation"}
+
+        if not isinstance(guild_id, str) or not SNOWFLAKE_RE.fullmatch(guild_id):
+            raise HTTPException(status_code=400, detail="Invalid guild_id")
+        if not isinstance(game_id, str) or not 8 <= len(game_id) <= 200:
+            raise HTTPException(status_code=400, detail="Invalid game_id")
+        if outcome not in {"win", "draw"} or reason not in valid_reasons:
+            raise HTTPException(status_code=400, detail="Invalid outcome or reason")
+        if (
+            not isinstance(player_ids, list)
+            or len(player_ids) != 2
+            or len(set(player_ids)) != 2
+            or any(not isinstance(value, str) or not SNOWFLAKE_RE.fullmatch(value)
+                   for value in player_ids)
+        ):
+            raise HTTPException(status_code=400, detail="player_ids must contain two Discord IDs")
+
+        winner_id = payload.get("winner_id")
+        loser_id = payload.get("loser_id")
+        if outcome == "win":
+            if (
+                not isinstance(winner_id, str)
+                or not isinstance(loser_id, str)
+                or {winner_id, loser_id} != set(player_ids)
+            ):
+                raise HTTPException(
+                    status_code=400,
+                    detail="A win requires matching winner_id and loser_id"
+                )
+        elif winner_id is not None or loser_id is not None:
+            raise HTTPException(status_code=400, detail="A draw cannot have a winner or loser")
+
+        guild = bot.get_guild(int(guild_id))
+        if not guild:
+            raise HTTPException(status_code=400, detail="Jinshi is not connected to this guild")
+        for player_id in player_ids:
+            member = guild.get_member(int(player_id))
+            if not member or member.bot:
+                raise HTTPException(status_code=400, detail="Every player must be a guild member")
+
+        checkers_config = bot.config.get("modules", {}).get("checkers", {})
+        if not checkers_config.get("enabled", True):
+            raise HTTPException(status_code=503, detail="Checkers integration is disabled")
+
+        try:
+            return await bot.db.record_checkers_result(
+                guild_id=int(guild_id),
+                player_ids=[int(value) for value in player_ids],
+                outcome=outcome,
+                game_id=game_id,
+                win_reward=int(checkers_config.get("win_reward", 150)),
+                winner_id=int(winner_id) if winner_id else None,
+                loser_id=int(loser_id) if loser_id else None
+            )
+        except ValueError as error:
+            raise HTTPException(status_code=400, detail=str(error))
+        except Exception:
+            logger.exception("Failed to record checkers result game_id=%s", game_id)
+            raise HTTPException(status_code=500, detail="Result could not be recorded")
 
     return app

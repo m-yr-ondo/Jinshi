@@ -86,10 +86,15 @@ modules:
       "1385336967343898697": "n33zr4q58dlyopmbqg9qmdfjd"
       "1137415421100822579": "onlyian"
 
+  checkers:
+    enabled: true
+    win_reward: 150
+    internal_api_port: 8090
+
 web:
   enabled: true
-  host: "0.0.0.0"
-  port: 8000
+  host: "127.0.0.1"
+  port: 8090
   cors_origins:
     - "http://localhost:3000"
     - "https://yourdomain.com"
